@@ -111,6 +111,14 @@ type ObjectInfo interface {
 	Storable() bool
 }
 
+type ObjectWithACL interface {
+	Object
+
+	// IsEqualToACL returns true if object's ACL is equal to ACL of dstWithACL
+	// and stores serialized ACLs to srcACL and dstACL respectively
+	IsEqualToACL(dstWithACL *ObjectWithACL, srcACL, dstACL *string) (bool, error)
+}
+
 // DirEntry provides read only information about the common subset of
 // a Dir or Object.  These are returned from directory listings - type
 // assert them into the correct type.

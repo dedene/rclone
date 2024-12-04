@@ -36,6 +36,7 @@ import (
 	"github.com/aws/smithy-go/logging"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/ncw/swift/v2"
 	"github.com/rclone/rclone/fs"
@@ -1954,6 +1955,11 @@ header is added and the default (private) will be used.
 				Help:  "Owner gets FULL_CONTROL.\nThe AuthenticatedUsers group gets READ access.",
 			}},
 		}, {
+			Name:     "copy_acl",
+			Help:     `If true copy the canned ACL for each object from the source to the destination.`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name:     "requester_pays",
 			Help:     "Enables requester pays option when interacting with S3 bucket.",
 			Provider: "AWS",
@@ -2833,6 +2839,7 @@ type Options struct {
 	LocationConstraint    string               `config:"location_constraint"`
 	ACL                   string               `config:"acl"`
 	BucketACL             string               `config:"bucket_acl"`
+	CopyACL               bool                 `config:"copy_acl"`
 	RequesterPays         bool                 `config:"requester_pays"`
 	ServerSideEncryption  string               `config:"server_side_encryption"`
 	SSEKMSKeyID           string               `config:"sse_kms_key_id"`
@@ -2907,14 +2914,15 @@ type Object struct {
 	//
 	// List will read everything but meta & mimeType - to fill
 	// that in you need to call readMetaData
-	fs           *Fs               // what this object is part of
-	remote       string            // The remote path
-	md5          string            // md5sum of the object
-	bytes        int64             // size of the object
-	lastModified time.Time         // Last modified
-	meta         map[string]string // The object metadata if known - may be nil - with lower case keys
-	mimeType     string            // MimeType of object - may be ""
-	versionID    *string           // If present this points to an object version
+	fs           *Fs                        // what this object is part of
+	remote       string                     // The remote path
+	md5          string                     // md5sum of the object
+	bytes        int64                      // size of the object
+	lastModified time.Time                  // Last modified
+	meta         map[string]string          // The object metadata if known - may be nil - with lower case keys
+	mimeType     string                     // MimeType of object - may be ""
+	versionID    *string                    // If present this points to an object version
+	acl          *types.AccessControlPolicy // ACL
 
 	// Metadata as pointers to strings as they often won't be present
 	storageClass       *string // e.g. GLACIER
@@ -4723,6 +4731,77 @@ func (f *Fs) copy(ctx context.Context, req *s3.CopyObjectInput, dstBucket, dstPa
 	})
 }
 
+// srcOwnerToDstOwner maps source bucket owner ID to target bucket owner ID
+// otherwise returns ID itself
+func srcOwnerToDstOwner(owner, srcBucketOwner, dstBucketOwner *string) *string {
+	if owner == nil || *owner != *srcBucketOwner {
+		return owner
+	}
+	return dstBucketOwner
+}
+
+// mappedOwnersACL maps every owner ID to target bucket owner ID if it equals to source bucket owner ID
+// using srcOwnerToDstOwner
+func mappedOwnersACL(acl *s3.GetObjectAclOutput, srcBucketOwner, dstBucketOwner *string) *s3.GetObjectAclOutput {
+	grants := make([]*types.Grant, len(acl.Grants))
+	for i, grant := range acl.Grants {
+		grants[i] = &types.Grant{
+			Grantee: &types.Grantee{
+				ID:          srcOwnerToDstOwner(grant.Grantee.ID, srcBucketOwner, dstBucketOwner),
+				DisplayName: grant.Grantee.DisplayName,
+				Type:        grant.Grantee.Type,
+				URI:         grant.Grantee.URI,
+			},
+			Permission: grant.Permission,
+		}
+	}
+
+	return &s3.GetObjectAclOutput{
+		Owner: &types.Owner{
+			ID:          srcOwnerToDstOwner(acl.Owner.ID, srcBucketOwner, dstBucketOwner),
+			DisplayName: acl.Owner.DisplayName,
+		},
+		Grants: []types.Grant{},
+	}
+}
+
+// copyWithACL calls copy, but also updates ACLs
+// it first saves current object's ACL from source and then sets it to target object
+// this order is important, because copy can change source object's ACL if it's equal
+// to target object, for example, SetModTime copies object to itself to update metadata
+// and rewrites ACL to one of the canned ACLs or "private" if not specified
+func (f *Fs) copyWithACL(ctx context.Context, req *s3.CopyObjectInput, dstBucket, dstPath, srcBucket, srcPath string, src *Object) error {
+	dst := &Object{
+		fs:     f,
+		remote: dstPath,
+	}
+
+	srcACL, err := src.getACL()
+	if err != nil {
+		return err
+	}
+
+	if err := f.copy(ctx, req, dstBucket, dstPath, srcBucket, srcPath, src); err != nil {
+		return err
+	}
+
+	srcBucketOwner, err := src.getBucketOwner()
+	if err != nil {
+		return err
+	}
+	dstBucketOwner, err := dst.getBucketOwner()
+	if err != nil {
+		return err
+	}
+
+	updatedACL := mappedOwnersACL(srcACL, srcBucketOwner, dstBucketOwner)
+	if err := dst.setACL(updatedACL); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func calculateRange(partSize, partIndex, numParts, totalSize int64) string {
 	start := partIndex * partSize
 	var ends string
@@ -4886,7 +4965,12 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		req.MetadataDirective = types.MetadataDirectiveReplace
 	}
 
-	err = f.copy(ctx, &req, dstBucket, dstPath, srcBucket, srcPath, srcObj)
+	if f.opt.CopyACL {
+		err = f.copyWithACL(ctx, &req, dstBucket, dstPath, srcBucket, srcPath, srcObj)
+	} else {
+		err = f.copy(ctx, &req, dstBucket, dstPath, srcBucket, srcPath, srcObj)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -5621,12 +5705,224 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 			return "", err
 		}
 	}
+
+	if o.fs.opt.CopyACL {
+		// detect if o.acl is blank
+		if o.acl == nil {
+			// fetch the object's ACL
+			objACL, err := o.getACL()
+			if err != nil {
+				return "", err
+			}
+
+			o.acl = &types.AccessControlPolicy{
+				Grants: objACL.Grants,
+				Owner:  objACL.Owner,
+			}
+		}
+
+		cannedACL := inferCannedACL(o.acl)
+		fs.Debugf(o, "Detected ACL: %s", cannedACL)
+
+		// concatenate the ACL with the MD5 hash to allow comparing
+		// this only happens when the modified time is not matching, so impact is low
+		return fmt.Sprintf("%s/%s", o.md5, cannedACL), nil
+	}
+
 	return o.md5, nil
 }
 
 // Size returns the size of an object in bytes
 func (o *Object) Size() int64 {
 	return o.bytes
+}
+
+// getACL returns receiver object's ACL
+func (o *Object) getACL() (*s3.GetObjectAclOutput, error) {
+	bucket, bucketPath := o.split()
+	objACL, err := o.fs.c.GetObjectAcl(context.Background(), &s3.GetObjectAclInput{
+		Bucket: &bucket,
+		Key:    &bucketPath,
+	})
+	if err != nil {
+		fs.LogLevelPrintf(
+			fs.LogLevelNotice, o, "Failed to get ACL for bucket=%s, key=%s: %v", bucket, bucketPath, err,
+		)
+		return nil, err
+	}
+	return objACL, nil
+}
+
+func (o *Object) setACL(acl *s3.GetObjectAclOutput) error {
+	bucket, bucketPath := o.split()
+	fs.Debugf(o, "Attempting to set ACL=%v to bucket=%s, key=%s", acl, bucket, bucketPath)
+	_, err := o.fs.c.PutObjectAcl(context.Background(), &s3.PutObjectAclInput{
+		AccessControlPolicy: &types.AccessControlPolicy{
+			Grants: acl.Grants,
+			Owner:  acl.Owner,
+		},
+		Bucket: &bucket,
+		Key:    &bucketPath,
+	})
+	if err != nil {
+		fs.LogLevelPrintf(
+			fs.LogLevelNotice, o, "Failed to set ACL=%v to bucket=%s, key=%s: %v", acl, bucket, bucketPath, err,
+		)
+	}
+	return err
+}
+
+// getBucketOwner returns object's bucket owner ID
+func (o *Object) getBucketOwner() (*string, error) {
+	bucket, _ := o.split()
+	bucketACL, err := o.fs.c.GetBucketAcl(context.Background(), &s3.GetBucketAclInput{
+		Bucket: &bucket,
+	})
+	if err != nil {
+		fs.LogLevelPrintf(fs.LogLevelNotice, o, "Failed to get object's bucket ACL: %v", err)
+		return nil, err
+	}
+	return bucketACL.Owner.ID, nil
+}
+
+func sameOwners(srcOwner, dstOwner, srcBucketOwner, dstBucketOwner *string) bool {
+	// for URIs like 'http://acs.amazonaws.com/groups/global/AllUsers' there is no owner
+	if srcOwner == nil && dstOwner == nil {
+		return true
+	} else if srcOwner == nil || dstOwner == nil {
+		return false
+	}
+
+	// owners could be considered the same if their IDs are equal
+	if *srcOwner == *dstOwner {
+		return true
+	}
+
+	// if buckets' owner IDs are different, to consider these owners the same
+	// the source object owner ID should be equal to source bucket owner ID
+	// and destination object owner ID should be equal to destination bucket owner ID
+	if *srcOwner == *srcBucketOwner && *dstOwner == *dstBucketOwner {
+		return true
+	}
+
+	return false
+}
+
+func sameGrant(src, dst *types.Grant, srcBucketOwner, dstBucketOwner *string) bool {
+	if !sameOwners(src.Grantee.ID, dst.Grantee.ID, srcBucketOwner, dstBucketOwner) {
+		return false
+	}
+
+	var toCompare = [][]interface{}{
+		{src.Permission, dst.Permission},
+		{src.Grantee.Type, dst.Grantee.Type},
+	}
+
+	for _, pair := range toCompare {
+		exp, act := pair[0], pair[1]
+		if !cmp.Equal(exp, act) {
+			return false
+		}
+	}
+
+	return true
+}
+
+type ByPermissionAndGranteeType []*types.Grant
+
+func (g ByPermissionAndGranteeType) Len() int {
+	return len(g)
+}
+func (g ByPermissionAndGranteeType) Less(i, j int) bool {
+	a, b := g[i], g[j]
+
+	if a.Permission == b.Permission {
+		if a.Grantee.Type == b.Grantee.Type {
+			return *a.Grantee.ID < *b.Grantee.ID
+		} else {
+			return a.Grantee.Type < b.Grantee.Type
+		}
+	} else {
+		return a.Permission < b.Permission
+	}
+}
+func (g ByPermissionAndGranteeType) Swap(i, j int) {
+	g[i], g[j] = g[j], g[i]
+}
+
+func sameGrants(src, dst []*types.Grant, srcBucketOwner, dstBucketOwner *string) bool {
+	if len(src) != len(dst) {
+		return false
+	}
+
+	sort.Sort(ByPermissionAndGranteeType(src))
+	sort.Sort(ByPermissionAndGranteeType(dst))
+
+	for i := 0; i < len(src); i++ {
+		srcGrant := src[i]
+		dstGrant := dst[i]
+
+		if !sameGrant(srcGrant, dstGrant, srcBucketOwner, dstBucketOwner) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// IsEqualToACL returns true if object's ACL is equal to ACL of dstWithACL
+// and stores serialized ACLs to srcACL and dstACL respectively
+func (o *Object) IsEqualToACL(dstWithACL *fs.ObjectWithACL, srcACL, dstACL *string) (bool, error) {
+	dstObject, ok := (*dstWithACL).(*Object)
+	if !ok {
+		return false, nil
+	}
+
+	src, err := o.getACL()
+	if err != nil {
+		return false, err
+	}
+	dst, err := dstObject.getACL()
+	if err != nil {
+		return false, err
+	}
+
+	srcBytes, err := json.Marshal(src)
+	if err != nil {
+		return false, err
+	}
+	dstBytes, err := json.Marshal(dst)
+	if err != nil {
+		return false, err
+	}
+
+	srcBucketOwner, err := o.getBucketOwner()
+	if err != nil {
+		return false, err
+	}
+	dstBucketOwner, err := dstObject.getBucketOwner()
+	if err != nil {
+		return false, err
+	}
+
+	*srcACL, *dstACL = string(srcBytes), string(dstBytes)
+
+	srcSlicePtr := make([]*types.Grant, len(src.Grants))
+	for i := range src.Grants {
+		srcSlicePtr[i] = &src.Grants[i]
+	}
+	dstSlicePtr := make([]*types.Grant, len(dst.Grants))
+	for i := range dst.Grants {
+		dstSlicePtr[i] = &dst.Grants[i]
+	}
+
+	if !sameOwners(src.Owner.ID, dst.Owner.ID, srcBucketOwner, dstBucketOwner) ||
+		!sameGrants(srcSlicePtr, dstSlicePtr, srcBucketOwner, dstBucketOwner) ||
+		src.RequestCharged != dst.RequestCharged {
+		return false, nil
+	}
+
+	return true, nil
 }
 
 func (o *Object) headObject(ctx context.Context) (resp *s3.HeadObjectOutput, err error) {
@@ -5982,6 +6278,18 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		o.fs.warnCompressed.Do(func() {
 			fs.Logf(o, "Not decompressing 'Content-Encoding: gzip' compressed file. Use --s3-decompress to override")
 		})
+	}
+
+	if o.fs.opt.CopyACL {
+		objACL, err := o.getACL()
+		if err != nil {
+			return resp.Body, nil
+		}
+
+		o.acl = &types.AccessControlPolicy{
+			Grants: objACL.Grants,
+			Owner:  objACL.Owner,
+		}
 	}
 
 	return resp.Body, nil
@@ -6353,6 +6661,88 @@ type uploadInfo struct {
 	md5sumHex string
 }
 
+// inferCannedACL attempts to detect the canned ACL from ACL grants
+func inferCannedACL(objectACL *types.AccessControlPolicy) (acl types.ObjectCannedACL) {
+	// Default to private if no grants
+	if objectACL == nil || len(objectACL.Grants) == 0 {
+		return types.ObjectCannedACLPrivate
+	}
+
+	var (
+		ownerFullControl bool
+		allUsersRead     bool
+		allUsersWrite    bool
+		authUsersRead    bool
+		bucketOwnerRead  bool
+		bucketOwnerWrite bool
+	)
+
+	ownerID := deref(objectACL.Owner.ID)
+
+	// Analyze each grant
+	for _, grant := range objectACL.Grants {
+		granteeType := grant.Grantee.Type
+		permission := grant.Permission
+
+		// Check for owner full control
+		if granteeType == types.TypeCanonicalUser &&
+			grant.Grantee.ID != nil && *grant.Grantee.ID == ownerID &&
+			permission == types.PermissionFullControl {
+			ownerFullControl = true
+		}
+
+		// Check for public access
+		if granteeType == types.TypeGroup &&
+			grant.Grantee.URI != nil && *grant.Grantee.URI == "http://acs.amazonaws.com/groups/global/AllUsers" {
+			if permission == types.PermissionRead {
+				allUsersRead = true
+			}
+			if permission == types.PermissionWrite {
+				allUsersWrite = true
+			}
+		}
+
+		// Check for authenticated users access
+		if granteeType == types.TypeGroup &&
+			grant.Grantee.URI != nil && *grant.Grantee.URI == "http://acs.amazonaws.com/groups/global/AuthenticatedUsers" {
+			if permission == types.PermissionRead {
+				authUsersRead = true
+			}
+			// if permission == types.PermissionWrite {
+			// 	authUsersWrite = true
+			// }
+		}
+
+		// Check for bucket owner access
+		if granteeType == types.TypeCanonicalUser &&
+			grant.Grantee.ID != nil && *grant.Grantee.ID != ownerID {
+			if permission == types.PermissionRead {
+				bucketOwnerRead = true
+			}
+			if permission == types.PermissionFullControl {
+				bucketOwnerWrite = true
+			}
+		}
+	}
+
+	// Determine canned ACL based on grant combinations
+	switch {
+	case ownerFullControl && allUsersRead && allUsersWrite:
+		return types.ObjectCannedACLPublicReadWrite
+	case ownerFullControl && allUsersRead:
+		return types.ObjectCannedACLPublicRead
+	case ownerFullControl && authUsersRead:
+		return types.ObjectCannedACLAuthenticatedRead
+	case ownerFullControl && bucketOwnerRead:
+		return types.ObjectCannedACLBucketOwnerRead
+	case ownerFullControl && bucketOwnerWrite:
+		return types.ObjectCannedACLBucketOwnerFullControl
+	default:
+		// Default to private if no other match
+		return types.ObjectCannedACLPrivate
+	}
+}
+
 // Prepare object for being uploaded
 //
 // If noHash is true the md5sum will not be calculated
@@ -6371,6 +6761,15 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options [
 		Bucket: &bucket,
 		ACL:    types.ObjectCannedACL(o.fs.opt.ACL),
 		Key:    &bucketPath,
+	}
+
+	if o.fs.opt.CopyACL {
+		// Attempt to get ACL from source object metadata
+		srcObj, ok := src.(*Object)
+		if ok && srcObj.acl != nil {
+			acl := inferCannedACL(srcObj.acl)
+			ui.req.ACL = types.ObjectCannedACL(string(acl))
+		}
 	}
 
 	// Fetch metadata if --metadata is in use
